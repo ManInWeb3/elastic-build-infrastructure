@@ -1,0 +1,409 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Jenkins master template'
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+  JenkinsMasterIP:
+    Description: IP address of Jenkins master if empty then will be assigned dynamically.
+    Type: 'String'
+  DockerRegistry:
+    Description: Docker registry to pull Docker images.
+    Type: 'String'
+  DockerUser:
+    Description: User name to login the given Docker registry.
+    Type: 'String'
+  DockerPassword:
+    Description: Password to login the given Docker registry.
+    Type: 'String'
+  LinAmiId:
+    Description: This image is used for Jenkins master and slaves.
+    Type: AWS::EC2::Image::Id
+  MasterHomeVolume:
+    Description: This EBS volume is used as Jenkins master home(can be populated with data).
+    Type: AWS::EC2::Volume::Id
+  CCACHEVolume:
+    Description: This EBS volume is used as a ccache volume shared with slaves over NFS(it's ccache cache).
+    Type: AWS::EC2::Volume::Id
+  VPCId:
+    Description: VPC id of the stack
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy Jenkins master
+  JenkinsMasterSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet to deploy Jenkins master
+  JenkinsMasterInstanceType:
+    Type: String
+    Description: Jenkins master instance type (must be correct EC2 type)
+  RootStackName:
+    Description: Root stack name
+    Type: String
+  JenkinsUser:
+    Type: String
+  JenkinsPassword:
+    Type: String
+  JenkinsLabelWinOnDemand:
+    Type: String
+  JenkinsQueueMetricWinOnDemand:
+    Type: String
+  JenkinsSlavesASGWinOnDemand:
+    Type: String
+  JenkinsLabelLinOnDemand:
+    Type: String
+  JenkinsQueueMetricLinOnDemand:
+    Type: String
+  JenkinsSlavesASGLinOnDemand:
+    Type: String
+  JenkinsQueueMetricOtherLabels:
+    Type: String
+  CWLogsGroupName:
+    Type: String
+  IAMProfile:
+    Type: String
+
+Conditions:
+  MasterIPIsSet: !Not [ !Equals [ !Ref JenkinsMasterIP, "" ]]
+Resources:
+  JenkinsMasterSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      # GroupName: !Sub '${AWS::StackName}-jenkinsmaster-sg'
+      GroupDescription: Enable access via ports 8080,50000, NFS, SMB, SSH
+        + SSH access
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '8080'
+          ToPort: '8080'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '50000'
+          ToPort: '50000'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: '0.0.0.0/0'
+        # Allow SMB
+        - IpProtocol: tcp
+          FromPort: '445'
+          ToPort: '445'
+          CidrIp: 0.0.0.0/0
+        # Allow NFS
+        - IpProtocol: tcp
+          FromPort: '111'
+          ToPort: '111'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '2049'
+          ToPort: '2049'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '32765'
+          ToPort: '32767'
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: udp
+          FromPort: '111'
+          ToPort: '111'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: '2049'
+          ToPort: '2049'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: '32765'
+          ToPort: '32767'
+          CidrIp: '0.0.0.0/0'
+        # 12345 for JMX monitoring
+        - IpProtocol: tcp
+          FromPort: '12345'
+          ToPort: '12345'
+          CidrIp: '0.0.0.0/0'
+        # 10050 for ZABBIX monitoring
+        - IpProtocol: tcp
+          FromPort: '10050'
+          ToPort: '10050'
+          CidrIp: '0.0.0.0/0'
+
+  JenkinsMasterInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          jenkins_master_start:
+            - setup_cfn
+            - run_nfs
+            - run_smb
+            - run_jenkins
+            - install_asg_manager
+            - configure_asg_manager
+            - install_configure_zabbix
+        setup_cfn:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                interval=5
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.JenkinsMasterInstance.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource JenkinsMasterInstance --configsets jenkins_master_start --region ${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+# Running NFS server container to publish ccache volume
+# Need to stop the server portmapper server, otherwise will have "111 port in use" error
+        run_nfs:
+          commands:
+            run_nfs_srv:
+              command: !Sub |
+                systemctl disable rpcbind.service
+                systemctl stop rpcbind.service
+                docker ps -a|grep nfs_srv && docker rm -f nfs_srv
+                docker run -d \
+                  --name nfs_srv \
+                  --log-driver=awslogs \
+                  --log-opt awslogs-region=us-east-1 \
+                  --log-opt awslogs-group=${CWLogsGroupName} \
+                  --log-opt awslogs-create-group=true \
+                  --log-opt tag=NFSServer \
+                  --privileged \
+                  --restart=always \
+                  -p 111:111 -p 111:111/udp \
+                  -p 2049:2049 -p 2049:2049/udp \
+                  -p 32765:32765 -p 32765:32765/udp \
+                  -p 32766:32766 -p 32766:32766/udp \
+                  -p 32767:32767 -p 32767:32767/udp \
+                  -v /nfsroot/ccache:/ccache \
+                  -e NFS_EXPORT_DIR_1=/ccache \
+                  -e NFS_EXPORT_DOMAIN_1=* \
+                  -e NFS_EXPORT_OPTIONS_1=rw,insecure,async,no_subtree_check,no_root_squash,fsid=1 \
+                  -v /nfsroot/references:/references \
+                  -e NFS_EXPORT_DIR_2=/references \
+                  -e NFS_EXPORT_DOMAIN_2=* \
+                  -e NFS_EXPORT_OPTIONS_2=rw,insecure,async,no_subtree_check,no_root_squash,fsid=2 \
+                  ${DockerRegistry}/navico-docker/navico-aws-env-nfs:latest
+              ignoreErrors: "false"
+# Running SMB server container to publish references for windows slaves
+        run_smb:
+          commands:
+            run_smb_srv:
+              command: !Sub |
+                mkdir -p /nfsroot/samba/references
+                chmod 777 /nfsroot/samba
+                chmod 777 /nfsroot/samba/references
+                docker ps -a|grep smb_srv && docker rm -f smb_srv
+                docker run -d \
+                  --name smb_srv \
+                  --log-driver=awslogs \
+                  --log-opt awslogs-region=us-east-1 \
+                  --log-opt awslogs-group=${CWLogsGroupName} \
+                  --log-opt awslogs-create-group=true \
+                  --log-opt tag=SMBServer \
+                  --restart=always \
+                  -v /nfsroot/samba:/share \
+                  -p 445:445 \
+                  ${DockerRegistry}/navico-docker/navico-aws-env-smb:latest
+              ignoreErrors: "false"
+# Running Jenkins master container
+        run_jenkins:
+          commands:
+            run_jenkins:
+              command: !Sub |
+                # Configure JVM Heap
+                JVMOPTS_HEAP="-XX:+AlwaysPreTouch -Xms16G -Xmx22G"
+                # Enable JMX
+                JVMOPTS_JMX="-Djava.rmi.server.hostname=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4) \
+                  -Dcom.sun.management.jmxremote=true \
+                  -Dcom.sun.management.jmxremote.port=12345 \
+                  -Dcom.sun.management.jmxremote.rmi.port=12345 \
+                  -Dcom.sun.management.jmxremote.ssl=false \
+                  -Dcom.sun.management.jmxremote.password.file=/var/jenkins_home/jmxremote.password"
+                # GC logging
+                JVMOPTS_GCLOG="-Xloggc:/var/jenkins_home/logs/gc-%t.log \
+                  -XX:+UseGCLogFileRotation \
+                  -XX:NumberOfGCLogFiles=5 \
+                  -XX:GCLogFileSize=20m \
+                  -XX:+PrintGC -XX:+PrintGCDateStamps -XX:+PrintGCDetails -XX:+PrintHeapAtGC \
+                  -XX:+PrintGCCause -XX:+PrintTenuringDistribution -XX:+PrintReferenceGC -XX:+PrintAdaptiveSizePolicy"
+                # G1 GC
+                JVMOPTS_G1GC="-XX:+UseG1GC \
+                  -XX:+ExplicitGCInvokesConcurrent \
+                  -XX:+ParallelRefProcEnabled \
+                  -XX:+UseStringDeduplication \
+                  -XX:+UnlockDiagnosticVMOptions \
+                  -XX:G1SummarizeRSetStatsPeriod=1"
+                docker ps -a|grep jenkins_srv && docker rm -f jenkins_srv
+                docker run -d -t \
+                  --rm \
+                  --name jenkins_srv \
+                  --log-driver=awslogs \
+                  --log-opt awslogs-region=us-east-1 \
+                  --log-opt awslogs-group=${CWLogsGroupName} \
+                  --log-opt awslogs-create-group=true \
+                  --log-opt tag=JenkinsMaster \
+                  -v /jenkins_home:/var/jenkins_home \
+                  -p 8080:8080 \
+                  -p 50000:50000 \
+                  -p 12345:12345 \
+                  --env JAVA_OPTS="-Dhudson.footerURL=http://bitbucket.navico.com $JVMOPTS_HEAP $JVMOPTS_JMX $JVMOPTS_GCLOG $JVMOPTS_G1GC" \
+                  jenkins/jenkins:lts
+              ignoreErrors: "false"
+
+        install_asg_manager:
+          commands:
+            install_asg_manager:
+              command: !Sub |
+                yum install -y git python2 python2-boto3 pytz
+                cd /opt
+                if [ -d "$DIRECTORY" ]; then
+                  # Control will enter here if $DIRECTORY exists.
+                  pushd aws-build-infrastructure
+                  git fetch
+                else
+                  git clone https://jenkins.bot:ocivan@bitbucket.navico.com/scm/bi/aws-build-infrastructure.git
+                  pushd aws-build-infrastructure
+                fi
+                git checkout master
+                cp -r ./asg_manager /opt
+
+        configure_asg_manager:
+          commands:
+            create_vars.py:
+              command: !Sub |
+                cat > /opt/asg_manager/vars.py << EOF
+                JENKINS_SERVER = "http://$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4):8080"
+                JENKINS_USR = "${JenkinsUser}"
+                JENKINS_PASS = "${JenkinsPassword}"
+
+                CLUSTER_REGION = "us-east-1"
+                ACCESS_KEY="AKIAJ3ZP5OIP7GYGTBUA"
+                SECRET_KEY="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"
+
+                JENKINS_LABEL_LIN_ONDEMAND = "${JenkinsLabelLinOnDemand}"
+                JENKINS_QUEUE_METRIC_LIN_ONDEMAND = "${JenkinsQueueMetricLinOnDemand}"
+                JENKINS_SLAVES_ASG_LIN_ONDEMAND = "${JenkinsSlavesASGLinOnDemand}"
+
+                #  Can provide only 1 label per ASG
+                JENKINS_LABEL_WIN_ONDEMAND = "${JenkinsLabelWinOnDemand}"
+                JENKINS_QUEUE_METRIC_WIN_ONDEMAND = "${JenkinsQueueMetricWinOnDemand}"
+                JENKINS_SLAVES_ASG_WIN_ONDEMAND = "${JenkinsSlavesASGWinOnDemand}"
+
+                JENKINS_QUEUE_METRIC_OTHERS_REQUIRED_LABELS = "${JenkinsQueueMetricOtherLabels}"
+
+                ELK_URL = "http://default.marine.net.int:9200"
+                ELK_JENKINS_BUILDS_INDEX = "jenkinsbuildsinfo_v2"
+                ELK_JENKINS_QUEUE_INDEX = "jenkinsqueue_v2"
+                ELK_ASG_INFO_INDEX = "slaveasginfo_v1"
+                JENKINS_JOB = "/job/NOS_multibranch/"
+
+                EOF
+          files:
+            /etc/cron.d/asg_manager_cron:
+              content: !Sub |
+                * *  * * *   root python /opt/asg_manager/asg_manager.py -t asg_manager 2>&1 >>/opt/asg_manager/asg_manager.log
+                */2 *  * * *   root python /opt/asg_manager/asg_manager.py -t queue2elk 2>&1 >>/opt/asg_manager/queue2elk.log
+                */5 *  * * *   root python /opt/asg_manager/asg_manager.py -t asgsize2elk 2>&1 >>/opt/asg_manager/asgsize2elk.log
+                17 *  * * *   root python /opt/asg_manager/asg_manager.py -t builds2elk 2>&1 >>/opt/asg_manager/builds2elk.log
+                0 1  * * *   root rm -f /opt/asg_manager/*.log
+              mode: '000400'
+              owner: root
+              group: root
+
+        install_configure_zabbix:
+          commands:
+            install_configure_zabbix:
+              command: !Sub |
+                rpm -Uvh http://repo.zabbix.com/zabbix/3.4/rhel/7/x86_64/zabbix-release-3.4-2.el7.noarch.rpm
+                yum install -y zabbix-agent
+                systemctl enable zabbix-agent
+                sed -i 's/^Server=.*/Server=zabbix-oklus\.marine\.net\.int/' /etc/zabbix/zabbix_agentd.conf
+                sed -i 's/^ServerActive=.*/ServerActive=zabbix-oklus\.marine\.net\.int/' /etc/zabbix/zabbix_agentd.conf
+                sed -i 's/^Hostname=.*/# Hostname= /' /etc/zabbix/zabbix_agentd.conf
+                sed -i 's/^HostMetadata=.*/# HostMetadata=/' /etc/zabbix/zabbix_agentd.conf
+                sed -i 's/^# HostMetadataItem=.*/HostMetadataItem=system.uname/' /etc/zabbix/zabbix_agentd.conf
+                systemctl restart zabbix-agent
+
+    Properties:
+      ImageId: !Ref LinAmiId
+      InstanceType: !Ref JenkinsMasterInstanceType
+      IamInstanceProfile: !Ref IAMProfile
+      SecurityGroupIds:
+        - !GetAtt JenkinsMasterSG.GroupId
+      KeyName: !Ref 'KeyName'
+      PrivateIpAddress: !If [MasterIPIsSet, !Ref JenkinsMasterIP, !Ref "AWS::NoValue" ]
+      SubnetId: !Ref JenkinsMasterSubnetId
+      BlockDeviceMappings:
+        - DeviceName: "/dev/xvda"
+          Ebs:
+            DeleteOnTermination: true
+            VolumeSize: 150
+      Volumes:
+        - Device: /dev/sdf
+          VolumeId: !Ref MasterHomeVolume
+        - Device: /dev/sdg
+          VolumeId: !Ref CCACHEVolume
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum install -y aws-cfn-bootstrap tmux
+
+          amazon-linux-extras install -y docker
+          systemctl enable docker
+          systemctl restart docker
+          docker login -u ${DockerUser} -p ${DockerPassword} ${DockerRegistry}
+
+          lsblk -r|grep disk | cut -f1 -d " " -s | \
+          while read disk; do
+            if [ $(mount |grep -c $disk) -eq 0 ]; then
+              mappdev=$(/sbin/ebsnvme-id -b /dev/$disk);
+              case $mappdev in
+              *"sdf")
+                mdir=/jenkins_home
+                ;;
+              *"sdg")
+                mdir=/nfsroot
+                ;;
+              *)
+                continue
+                ;;
+              esac
+              if [ ! -d $mdir ]; then
+                mkdir $mdir
+              fi
+              # mount /dev/${!disk}p1 $mdir
+              echo "/dev/${!disk}p1 $mdir xfs    defaults,noatime    1    1" >> /etc/fstab
+              chmod 777 $mdir
+            fi
+          done
+          mount -a
+
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource JenkinsMasterInstance --configsets jenkins_master_start --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource JenkinsMasterInstance --region ${AWS::Region}
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+
+Outputs:
+  JenkinsMasterIP:
+    Description: Jenkins master panel
+    Value: !GetAtt JenkinsMasterInstance.PrivateIp
+  JenkinsMasterURL:
+    Description: Jenkins master panel
+    Value: !Join ['', ['http://', !GetAtt 'JenkinsMasterInstance.PrivateIp', ':8080']]

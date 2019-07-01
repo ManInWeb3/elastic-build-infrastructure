@@ -1,0 +1,119 @@
+{
+  "variables": {
+    "aws_access_key": "{{env `AWS_ACCESS_KEY_ID`}}",
+    "aws_secret_key": "{{env `AWS_SECRET_ACCESS_KEY`}}",
+    "DockerRegistry": "{{user `DockerRegistry`}}",
+    "DockerUser":     "{{user `DockerUser`}}",
+    "DockerPassword": "{{user `DockerPassword`}}",
+    "region":         "us-east-1",
+    "instance_type":  "t3.xlarge",
+    "subnet_id":      "subnet-06b2cf6b",
+    "SlaveTag":       "{{user `WindowsSlaveTag`}}"
+  },
+  "builders": [
+    {
+      "type": "amazon-ebs",
+      "tags": {
+        "info:opsPOC": "seth.bacon@navico.com",
+        "info:devPOC": "Vladimir.shevelev@navico.com",
+        "info:busPOC": "tom.edvardsen@navico.com",
+        "cc:segment": "SHARE",
+        "cc:project": "Infrastructure R+D",
+        "cc:environment": "PROD",
+        "env:buildsystem": "RND",
+        "WindowsSlaveTag": "{{user `SlaveTag`}}"
+
+      },
+      "run_tags": {
+        "info:opsPOC": "seth.bacon@navico.com",
+        "info:devPOC": "Vladimir.shevelev@navico.com",
+        "info:busPOC": "tom.edvardsen@navico.com",
+        "cc:segment": "SHARE",
+        "cc:project": "Infrastructure R+D",
+        "cc:environment": "PROD",
+        "env:buildsystem": "RND",
+        "WindowsSlaveTag": "{{user `SlaveTag`}}"
+      },
+
+      "access_key": "{{ user `aws_access_key` }}",
+      "secret_key": "{{ user `aws_secret_key` }}",
+      "region": "{{ user `region` }}",
+      "instance_type": "{{ user `instance_type` }}",
+      "subnet_id": "{{ user `subnet_id`}}",
+      "source_ami_filter": {
+        "filters": {
+          "virtualization-type": "hvm",
+          "name": "Windows_Server-2019-English-Core-ContainersLatest-*",
+          "root-device-type": "ebs"
+        },
+        "most_recent": true,
+        "owners": "amazon"
+      },
+      "launch_block_device_mappings" : [{
+        "device_name" : "/dev/sda1",
+        "delete_on_termination" : true,
+        "volume_size" : 200,
+        "encrypted":false,
+        "volume_type" : "gp2"
+      }],
+      "ami_block_device_mappings":[{
+        "device_name" : "/dev/sda1",
+        "delete_on_termination" : true,
+        "volume_size" : 200,
+        "encrypted":false,
+        "volume_type" : "gp2"
+      }],
+      "ami_name": "ami-windowsdockerhost-jenkinsslavescached-{{timestamp}}",
+      "user_data_file": "./bootstrap_win.txt",
+      "communicator": "winrm",
+      "winrm_username": "Administrator",
+      "winrm_password": "SuperS3cr3t!"
+    }
+  ],
+  "provisioners": [
+    {
+      "type": "powershell",
+      "environment_vars": ["DEVOPS_LIFE_IMPROVER=PACKER"],
+      "inline": [
+        "Write-Host \"Disable auto updates\"",
+        "Net stop wuauserv",
+        "cd C:\\Windows\\system32; Cscript scregedit.wsf /AU 1",
+        "Net start wuauserv",
+        "Write-Host \"Uninstall Windows-Defender antivirus\"",
+        "Uninstall-WindowsFeature -Name Windows-Defender",
+        "Write-Host \"Enable disk performance monitoring\"",
+        "diskperf -Y"
+      ]
+    },
+    {
+      "type": "windows-restart"
+    },
+    {
+      "type": "powershell",
+      "environment_vars": ["DEVOPS_LIFE_IMPROVER=PACKER"],
+      "inline": [
+        "Write-Host \"Cache docker image\"",
+        "docker login -u {{ user `DockerUser` }} -p {{ user `DockerPassword` }} {{ user `DockerRegistry` }}",
+        "docker pull {{ user `DockerRegistry` }}/navico-docker/docker-navico-windows-sdk:{{ user `SlaveTag` }}",
+        "docker image ls"
+      ]
+    },
+    {
+      "type": "powershell",
+      "environment_vars": ["DEVOPS_LIFE_IMPROVER=PACKER"],
+      "inline": [
+        "Write-Host \"Generalise windows\"",
+        "type C:\\ProgramData\\Amazon\\EC2-Windows\\Launch\\Config\\LaunchConfig.json",
+        "C:\\ProgramData\\Amazon\\EC2-Windows\\Launch\\Scripts\\InitializeInstance.ps1 -Schedule",
+        "C:\\ProgramData\\Amazon\\EC2-Windows\\Launch\\Scripts\\SysprepInstance.ps1"
+      ]
+    }
+  ],
+ "post-processors": [
+    {
+      "type": "manifest",
+      "output": "WindowsSlavesAMI-manifest.json",
+      "strip_path": true
+    }
+  ]
+}

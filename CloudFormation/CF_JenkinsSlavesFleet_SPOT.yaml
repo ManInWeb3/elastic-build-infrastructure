@@ -1,0 +1,299 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Deploy ASG for jenkins slaves
+             for given OS'
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+  SlavesLabel:
+    Description: Jenkins label for the slaves (Should you 1 abel per ASG).
+    Type: 'String'
+  DockerRegistry:
+    Description: Docker registry to pull Docker images.
+    Type: 'String'
+    Default: 'artifacts.navico.com'
+  DockerUser:
+    Description: User name to login the given Docker registry.
+    Type: String
+    Default: dockerregistry_readonly
+  DockerPassword:
+    Description: Password to login the given Docker registry.
+    Type: String
+    Default: AP68nXwiVUUF9nkA
+  SlavesAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: This image is used for Jenkins slaves
+  SlavesOS:
+    Description: OS for the slaves
+    Type: 'String'
+    AllowedValues:
+      - linux
+      - windows
+    Default: linux
+  SlavesInstanceType:
+    Description: EC2 instance type
+    Type: 'String'
+    Default: m5.2xlarge
+  SlavesSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet to deploy Jenkins master
+    Default: subnet-06b2cf6b
+  # SlavesAZ:
+  #   Type: String
+  #   Description: AZs to deploy asg
+  VPCId:
+    Description: VPC id of the stack
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-d1b3cebc
+  JenkinsMasterURL:
+    Type: String
+    Description: URL of the Jenkins master
+  # JenkinsQueueMetricName:
+  #   Type: String
+  #   Description: Jenkins queue Cloud Watch metric name
+  # JenkinsSlavesASGName:
+  #   Type: String
+  #   Description: ASG name
+  NFSserverIP:
+    Type: String
+    Description: NFS server ip to mount CCACHE and refernces volumes
+
+Conditions:
+  IfLinux:
+    !Equals [ !Ref SlavesOS, "linux" ]
+  IfWindows:
+    !Equals [ !Ref SlavesOS, "windows" ]
+
+Resources:
+  JenkinsSlavesFleetSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'secg-${AWS::StackName}-jenkinsslaves-${SlavesOS}'
+      GroupDescription: Enable access to slaves
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 3389
+        ToPort: 3389
+        CidrIp: 0.0.0.0/0
+
+  spotFleetRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - spotfleet.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetRole
+      Path: /
+    Type: AWS::IAM::Role
+
+  JenkinsSlavesFleetLTLin:
+    Type: "AWS::EC2::LaunchTemplate"
+    Condition: 'IfLinux'
+    Properties:
+      LaunchTemplateName: !Sub 'lt-${AWS::StackName}-jenkinsslaves-${SlavesOS}'
+      LaunchTemplateData:
+        InstanceType: !Ref 'SlavesInstanceType'
+        KeyName: !Ref 'KeyName'
+        SecurityGroupIds:
+          - !GetAtt JenkinsSlavesFleetSG.GroupId
+        ImageId: !Ref SlavesAmiId
+        UserData:
+          Fn::Base64:
+            !Sub |
+              #!/bin/bash -xe
+              MAX_TRIES=5
+              function dockerIsReady() {
+                docker ps > /dev/null 2>&1
+              }
+              until dockerIsReady || [ $MAX_TRIES -eq 0 ]; do
+                echo "Waiting for docker service to start, $((MAX_TRIES--)) remaining attempts..."
+                sleep 5
+              done
+              # systemctl restart docker
+
+              docker volume create --driver local --opt type=nfs --opt o=addr=${NFSserverIP},noac,noatime,async,rw,nolock,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport --opt device=:/ccache container-ccache
+              docker volume create --driver local --opt type=nfs --opt o=addr=${NFSserverIP},noatime,async,rw,nolock,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport --opt device=:/references reference-repos
+
+              docker login -u ${DockerUser} -p ${DockerPassword} ${DockerRegistry}
+
+              # Instance name
+              INSTANCEID="$(curl -s http://169.254.169.254/latest/meta-data/instance-id)"
+              # Run jenkins slave container
+              docker run -d \
+                --name $INSTANCEID \
+                -h $INSTANCEID \
+                -e "JENKINS_URL=${JenkinsMasterURL}" \
+                -e "JENKINS_LABELS=${SlavesLabel}" \
+                -e "BUILD_ENV=AWS" \
+                -v container-ccache:/var/cache/ccache \
+                -v reference-repos:/home/build/references \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                ${DockerRegistry}/navico-docker/docker-ubuntu-pipeline-agent:aws-latest
+
+  JenkinsSlavesSpotFleet:
+    Type: AWS::EC2::SpotFleet
+    Properties:
+      SpotFleetRequestConfigData:
+        AllocationStrategy: lowestPrice
+        ExcessCapacityTerminationPolicy: noTermination
+        IamFleetRole:
+          Fn::GetAtt:
+          - spotFleetRole
+          - Arn
+        # InstanceInterruptionBehavior: String       
+        LaunchTemplateConfigs:
+          - LaunchTemplateSpecification:
+              LaunchTemplateId: !Ref 'JenkinsSlavesFleetLTLin'
+              Version: !GetAtt JenkinsSlavesFleetLTLin.LatestVersionNumber
+            Overrides:
+              - InstanceType: "c5.4xlarge"
+                WeightedCapacity: 1
+                SubnetId: "subnet-06b2cf6b"
+              - InstanceType: "c5.4xlarge"
+                WeightedCapacity: 1
+                SubnetId: "subnet-c8b2cfa5"
+              - InstanceType: "c5.4xlarge"
+                WeightedCapacity: 1
+                SubnetId: "subnet-d5b2cfb8"
+              - InstanceType: "c3.4xlarge"
+                WeightedCapacity: 1
+                SubnetId: "subnet-06b2cf6b"
+              - InstanceType: "c3.4xlarge"
+                WeightedCapacity: 1
+                SubnetId: "subnet-c8b2cfa5"
+              - InstanceType: "c3.4xlarge"
+                WeightedCapacity: 1
+                SubnetId: "subnet-d5b2cfb8"
+              - InstanceType: "c4.4xlarge"
+                WeightedCapacity: 1
+                SubnetId: "subnet-06b2cf6b"
+              - InstanceType: "c4.4xlarge"
+                WeightedCapacity: 1
+                SubnetId: "subnet-c8b2cfa5"
+              - InstanceType: "c4.4xlarge"
+                WeightedCapacity: 1
+                SubnetId: "subnet-d5b2cfb8"
+        ReplaceUnhealthyInstances: true
+        # SpotPrice: String
+        TargetCapacity: 0
+        Type: maintain
+        # TerminateInstancesWithExpiration: true
+        # ValidFrom: String
+        # ValidUntil: String
+
+
+  # JenkinsSlavesLTWin:
+  #   Type: "AWS::EC2::LaunchTemplate"
+  #   Condition: 'IfWindows'
+  #   Properties:
+  #     LaunchTemplateName: !Sub 'lt-${AWS::StackName}-jenkinsslaves-${SlavesOS}'
+  #     LaunchTemplateData:
+  #       InstanceType: !Ref 'SlavesInstanceType'
+  #       KeyName: !Ref 'KeyName'
+  #       SecurityGroupIds:
+  #         - !GetAtt JenkinsSlavesSG.GroupId
+  #       ImageId: !Ref SlavesAmiId
+  #       # BlockDeviceMappings: - Configured in AMI with PACKER
+  #       UserData:
+  #         Fn::Base64: !Sub |
+  #               <powershell>
+  #               docker login -u ${DockerUser} -p ${DockerPassword} ${DockerRegistry}
+  #               docker pull ${DockerRegistry}/navico-docker/docker-navico-windows-sdk:qt5122-dev
+  #               $INSTANCEID = (new-object Net.WebClient).DownloadString("http://169.254.169.254/latest/meta-data/instance-id")
+  #               docker run -d --rm `
+  #                 --name $INSTANCEID `
+  #                 -h $INSTANCEID `
+  #                 --storage-opt "size=100GB" `
+  #                 -e "JENKINS_URL=${JenkinsMasterURL}" `
+  #                 -e "JENKINS_LABELS=${SlavesLabel}" `
+  #                 ${DockerRegistry}/navico-docker/docker-navico-windows-sdk:qt5122-dev
+  #               </powershell>
+
+  # JenkinsSlavesASG:
+  #   Type: AWS::AutoScaling::AutoScalingGroup
+  #   Properties:
+  #     AutoScalingGroupName: !Ref JenkinsSlavesASGName
+  #     VPCZoneIdentifier: !Ref SlavesSubnets
+  #     AvailabilityZones:
+  #       - !Ref SlavesAZ
+  #     # AvailabilityZone: !Select
+  #     #     - 0
+  #     #     - Fn::GetAZs: !Ref 'AWS::Region'
+  #     Cooldown: !If [IfLinux, 600, 900 ]
+  #     HealthCheckGracePeriod: 300
+  #     # DesiredCapacity: 0
+  #     MaxSize: !If [IfLinux, 30, 10 ]
+  #     MinSize: 0
+  #     LaunchTemplate:
+  #       LaunchTemplateId: !If [IfLinux, !Ref 'JenkinsSlavesLTLin', !Ref 'JenkinsSlavesLTWin' ]
+  #       Version: !If [IfLinux, !GetAtt JenkinsSlavesLTLin.LatestVersionNumber, !GetAtt JenkinsSlavesLTWin.LatestVersionNumber]
+  #     MetricsCollection:
+  #       - Granularity: 1Minute
+  #         Metrics:
+  #           - GroupMaxSize
+  #           - GroupMinSize
+  #           - GroupDesiredCapacity
+  #           - GroupTerminatingInstances
+  #           - GroupPendingInstances
+  #           - GroupTotalInstances
+  #           - GroupInServiceInstances
+  #           - GroupStandbyInstances
+
+  # JenkinsQueueSizeAlarm:
+  #   Type: AWS::CloudWatch::Alarm
+  #   Properties:
+  #     AlarmName: !Sub 'alarm-${AWS::StackName}-jenkinsqueue-${SlavesOS}'
+  #     AlarmDescription: Scale-up if Jenkins masterr require more Slaves this ASG can provide
+  #     MetricName: !Ref JenkinsQueueMetricName
+  #     Namespace: BuildEnv/Jenkins
+  #     Statistic: Average
+  #     Period: 60
+  #     EvaluationPeriods: 1
+  #     Threshold: 0
+  #     TreatMissingData: notBreaching
+  #     AlarmActions: [!Ref 'JenkinsSlavesASGScaleUpPolicy']
+  #     Dimensions:
+  #     # Defined in aws_autoscale_manager.py
+  #     - Name: JobsInQueue
+  #       Value: JOBS
+  #     ComparisonOperator: GreaterThanThreshold
+
+  # JenkinsSlavesASGScaleUpPolicy:
+  #   Type: AWS::AutoScaling::ScalingPolicy
+  #   Properties:
+  #     AdjustmentType: ChangeInCapacity
+  #     AutoScalingGroupName: !Ref 'JenkinsSlavesASG'
+  #     PolicyType: StepScaling
+  #     StepAdjustments:
+  #       - MetricIntervalLowerBound: 0
+  #         MetricIntervalUpperBound: 2
+  #         ScalingAdjustment: 1
+  #       - MetricIntervalLowerBound: 2
+  #         MetricIntervalUpperBound: 5
+  #         ScalingAdjustment: 3
+  #       - MetricIntervalLowerBound: 5
+  #         MetricIntervalUpperBound: 10
+  #         ScalingAdjustment: 5
+  #       - MetricIntervalLowerBound: 10
+  #         ScalingAdjustment: 9
+
+# Outputs:
+#   JenkinsQueueMetricName:
+#     Value: !Ref JenkinsQueueMetricName
+#   JenkinsSlavesASGName:
+#     Value: !Ref JenkinsSlavesASGName
+#   JenkinsMasterURL:
+#     Description: Jenkins master panel
+#     Value: !Join ['', ['http://', !GetAtt 'JenkinsMasterInstance.PrivateIp', ':8080']]

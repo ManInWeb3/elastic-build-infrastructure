@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Root stack to deploy AWS build infrastructure.'
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+  JenkinsMasterIP:
+    Description: IP address of Jenkins master. Default is empty string so AWS will assign a random ip to the master
+    Type: 'String'
+    Default: ''
+  JenkinsUser:
+    Description: User name to call Jenkins master API.
+    Type: 'String'
+    Default: 'vladimir.shevelev'
+  JenkinsPassword:
+    Description: Password to call Jenkins master API.
+    Type: 'String'
+    Default: '8c438ab45c2a496e51f5aec4d9fd3f1b'
+  DockerRegistry:
+    Description: Docker registry to pull Docker images.
+    Type: 'String'
+    Default: 'artifacts.navico.com'
+  DockerUser:
+    Description: User name to login the given Docker registry.
+    Type: String
+    Default: dockerregistry_readonly
+  DockerPassword:
+    Description: Password to login the given Docker registry.
+    Type: String
+    Default: AP68nXwiVUUF9nkA
+  JenkinsMasterAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+    Description: This image is used for Jenkins master.
+  JenkinsLinSlaveDockerTag:
+    Description: Docker tag of navico-docker/docker-ubuntu-pipeline-agent image
+    Type: String
+  JenkinsWinSlaveDockerTag:
+    Description: Docker tag of navico-docker/docker-ubuntu-pipeline-agent image
+    Type: String
+  LinAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: This image is used for Jenkins slaves. It's created by packer and has pulled SDK images.
+  WinAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: This image is used for windows Jenkins slaves. It's created by packer and has pulled swarm images.
+  MasterHomeVolume:
+    Description: This EBS volume is used as Jenkins master home(can be and should be populated with data).
+    Type: AWS::EC2::Volume::Id
+    ConstraintDescription: Must be the id of an existing volume.
+  CCACHEVolume:
+    Description: This EBS volume is used as a ccache volume shared with slaves over NFS(it's ccache cache).
+    Type: AWS::EC2::Volume::Id
+    ConstraintDescription: Must be the id of an existing volume.
+  SlavesLabelWin:
+    Description: Label for windows slaves
+    Type: String
+    Default: windows-vs2017
+  SlavesLabelLin:
+    Description: Label for Linux slaves
+    Type: String
+    Default: docker_client
+
+Mappings:
+  Constants:
+    BuildCluster:
+      VPCId: vpc-d1b3cebc
+    JenkinsMaster:
+      SubnetId: subnet-06b2cf6b
+      InstanceType: m5.2xlarge
+      AZ: us-east-1a
+    JenkinsSlaves:
+      Subnets:
+        - subnet-06b2cf6b
+      AZs:
+        - us-east-1a
+        - us-east-1b
+        - us-east-1c
+      InstanceType: c5.4xlarge
+
+Resources:
+  CWLogsStack:
+    Type: "AWS::CloudFormation::Stack"
+    Properties:
+      TemplateURL: "CF_CWLogs.yaml"
+      Parameters:
+        CWLogsGroupName: !Ref AWS::StackName
+
+  JenkinsMasterStack:
+    Type: "AWS::CloudFormation::Stack"
+    DependsOn:
+      - CWLogsStack
+    Properties:
+      TemplateURL: "CF_JenkinsMaster.yaml"
+      Parameters:
+        DockerRegistry:  !Ref DockerRegistry
+        DockerUser:  !Ref DockerUser
+        DockerPassword:  !Ref DockerPassword
+        JenkinsMasterIP: !Ref JenkinsMasterIP
+        KeyName: !Ref KeyName
+        LinAmiId:  !Ref JenkinsMasterAmiId
+        MasterHomeVolume:  !Ref MasterHomeVolume
+        CCACHEVolume:  !Ref CCACHEVolume
+        VPCId: !FindInMap [ Constants, BuildCluster, VPCId ]
+        JenkinsMasterSubnetId: !FindInMap [ Constants, JenkinsMaster, SubnetId ]
+        JenkinsMasterInstanceType: !FindInMap [ Constants, JenkinsMaster, InstanceType ]
+        RootStackName: !Ref AWS::StackName
+        JenkinsUser: !Ref JenkinsUser
+        JenkinsPassword: !Ref JenkinsPassword
+        JenkinsLabelWinOnDemand: !Ref SlavesLabelWin
+        JenkinsQueueMetricWinOnDemand: !Sub 'metric-${AWS::StackName}-jenkinsqueue-windows-ondemand'
+        JenkinsSlavesASGWinOnDemand: !Sub 'asg-${AWS::StackName}-jenkinsslaves-windows-ondemand'
+        JenkinsLabelLinOnDemand: !Ref SlavesLabelLin
+        JenkinsQueueMetricLinOnDemand: !Sub 'metric-${AWS::StackName}-jenkinsqueue-linux-ondemand'
+        JenkinsSlavesASGLinOnDemand: !Sub 'asg-${AWS::StackName}-jenkinsslaves-linux-ondemand'
+        JenkinsQueueMetricOtherLabels: !Sub 'metric-${AWS::StackName}-jenkinsqueue-other-requested'
+        CWLogsGroupName: !Ref AWS::StackName
+        IAMProfile:
+          Fn::GetAtt: [ "CWLogsStack", "Outputs.IAMProfile" ]
+
+  JenkinsLinuxSlavesStack:
+    Type: "AWS::CloudFormation::Stack"
+    DependsOn:
+      - JenkinsMasterStack
+    Properties:
+      TemplateURL: "CF_JenkinsSlavesASG_ONDEMAND.yaml"
+      Parameters:
+        SlavesOS: "linux"
+        SlavesLabel: !Ref SlavesLabelLin
+        SlavesAmiId: !Ref LinAmiId
+        NFSServerIP:
+          Fn::GetAtt: [ "JenkinsMasterStack", "Outputs.JenkinsMasterIP" ]
+        JenkinsSlaveDockerTag: !Ref JenkinsLinSlaveDockerTag
+        DockerRegistry:  !Ref DockerRegistry
+        DockerUser:  !Ref DockerUser
+        DockerPassword:  !Ref DockerPassword
+        KeyName: !Ref KeyName
+        JenkinsMasterURL:
+          Fn::GetAtt: [ "JenkinsMasterStack", "Outputs.JenkinsMasterURL" ]
+        SlavesInstanceType: !FindInMap [ Constants, JenkinsSlaves, InstanceType ]
+        SlavesAZ: !FindInMap [ Constants, JenkinsMaster, AZ ]
+        SlavesSubnets: !FindInMap [ Constants, JenkinsMaster, SubnetId ]
+        VPCId: !FindInMap [ Constants, BuildCluster, VPCId ]
+        JenkinsQueueMetricName: !Sub 'metric-${AWS::StackName}-jenkinsqueue-linux-ondemand'
+        JenkinsSlavesASGName: !Sub 'asg-${AWS::StackName}-jenkinsslaves-linux-ondemand'
+        CWLogsGroupName: !Ref AWS::StackName
+        IAMProfileARN:
+          Fn::GetAtt: [ "CWLogsStack", "Outputs.IAMProfileARN" ]
+
+  JenkinsWindowsSlavesStack:
+    Type: "AWS::CloudFormation::Stack"
+    DependsOn:
+      - JenkinsMasterStack
+    Properties:
+      TemplateURL: "CF_JenkinsSlavesASG_ONDEMAND.yaml"
+      Parameters:
+        SlavesOS: "windows"
+        SlavesLabel: !Ref SlavesLabelWin
+        SlavesAmiId: !Ref WinAmiId
+        SMBServerIP:
+          Fn::GetAtt: [ "JenkinsMasterStack", "Outputs.JenkinsMasterIP" ]
+        JenkinsSlaveDockerTag: !Ref JenkinsWinSlaveDockerTag
+        DockerRegistry:  !Ref DockerRegistry
+        DockerUser:  !Ref DockerUser
+        DockerPassword:  !Ref DockerPassword
+        KeyName: !Ref KeyName
+        JenkinsMasterURL:
+          Fn::GetAtt: [ "JenkinsMasterStack", "Outputs.JenkinsMasterURL" ]
+        SlavesInstanceType: !FindInMap [ Constants, JenkinsSlaves, InstanceType ]
+        SlavesAZ: !FindInMap [ Constants, JenkinsMaster, AZ ]
+        # Deploy all ondemand asg in master's subnet
+        SlavesSubnets: !FindInMap [ Constants, JenkinsMaster, SubnetId ]
+        VPCId: !FindInMap [ Constants, BuildCluster, VPCId ]
+        JenkinsQueueMetricName: !Sub 'metric-${AWS::StackName}-jenkinsqueue-windows-ondemand'
+        JenkinsSlavesASGName: !Sub 'asg-${AWS::StackName}-jenkinsslaves-windows-ondemand'
+        CWLogsGroupName: !Ref AWS::StackName
+        IAMProfileARN:
+          Fn::GetAtt: [ "CWLogsStack", "Outputs.IAMProfileARN" ]
+
+  # JenkinsLinuxSlavesSpotFleetStack:
+  #   Type: "AWS::CloudFormation::Stack"
+  #   DependsOn:
+  #     - JenkinsMasterStack
+  #   Properties:
+  #     TemplateURL: "CF_JenkinsSlavesFleet_SPOT.yaml"
+  #     Parameters:
+  #       SlavesOS: "linux"
+  #       SlavesLabel: "docker_client"
+  #       #!Ref SlavesLabelLin
+  #       NFSserverIP: 10.33.1.188
+  #       SlavesAmiId: !Ref LinAmiId
+  #       DockerRegistry:  !Ref DockerRegistry
+  #       DockerUser:  !Ref DockerUser
+  #       DockerPassword:  !Ref DockerPassword
+  #       KeyName: !Ref KeyName
+  #       JenkinsMasterURL:
+  #         Fn::GetAtt: [ "JenkinsMasterStack", "Outputs.JenkinsMasterURL" ]
+  #         # Fn::ImportValue: !Sub "${AWS::StackName}-JenkinsMasterURL"
+  #       SlavesInstanceType: !FindInMap [ Constants, JenkinsSlaves, InstanceType ]
+  #       # SlavesAZ: !FindInMap [ Constants, JenkinsMaster, AZ ]
+  #       # Deploy all ondemand asg in master's subnet
+  #       SlavesSubnets: !FindInMap [ Constants, JenkinsMaster, SubnetId ]
+  #       VPCId: !FindInMap [ Constants, BuildCluster, VPCId ]
+  #       # JenkinsQueueMetricName: !Sub 'metric-${AWS::StackName}-jenkinsqueue-linux-ondemand'
+  #       # JenkinsSlavesASGName: !Sub 'asg-${AWS::StackName}-jenkinsslaves-linux-ondemand'
+
+Outputs:
+  JenkinsMasterURL:
+    Description: URL of the Jenkins master
+    Value:
+      Fn::GetAtt: [ "JenkinsMasterStack", "Outputs.JenkinsMasterURL" ]
+  LogGroupURL:
+    Description: CW logs group URL
+    Value:
+      Fn::GetAtt: [ "CWLogsStack", "Outputs.LogGroupURL" ]

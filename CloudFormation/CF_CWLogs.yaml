@@ -1,0 +1,58 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Creates CW logs groups and IAM profile for ec2 to be able to send logs to the logs group'
+Parameters:
+  CWLogsGroupName:
+    Type: String
+Resources:
+
+  CWLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref CWLogsGroupName
+      RetentionInDays: 7
+
+# IAM role with right to send logs to CW
+  CWLogsIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+      - PolicyName: !Sub '${CWLogsGroupName}CWLogsIAMRole'
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - cloudwatch:PutMetricData
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - logs:DescribeLogStreams
+            Resource: 'arn:aws:logs:*:*:*'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+
+  IAMProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${CWLogsGroupName}IAMProfile'
+      Path: "/"
+      Roles:
+        - !Ref CWLogsIAMRole
+
+Outputs:
+  IAMProfileARN:
+    Description: IAM profile to allow putting logs into CW
+    Value: !GetAtt IAMProfile.Arn
+  IAMProfile:
+    Description: IAM profile to allow putting logs into CW
+    Value: !Ref IAMProfile
+  LogGroupURL:
+    Description: URL to the created CW logs group
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#logStream:group=${CWLogsGroupName}'

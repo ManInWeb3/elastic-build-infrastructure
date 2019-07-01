@@ -1,0 +1,6 @@
+# Used by NFS and SAMBA containers
+REPONAME=$(basename $(git remote show -n origin | grep Fetch | cut -d: -f2- ) | cut -d'.' -f1)
+TAGNFS=navico-docker/${REPONAME}-nfs
+TAGSMB=navico-docker/${REPONAME}-smb
+REGISTRY=artifacts.navico.com
+

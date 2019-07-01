@@ -1,0 +1,110 @@
+{
+  "variables": {
+    "aws_access_key": "{{env `AWS_ACCESS_KEY_ID`}}",
+    "aws_secret_key": "{{env `AWS_SECRET_ACCESS_KEY`}}",
+    "DockerRegistry": "{{user `DockerRegistry`}}",
+    "DockerUser":     "{{user `DockerUser`}}",
+    "DockerPassword": "{{user `DockerPassword`}}",
+    "region":         "us-east-1",
+    "instance_type":  "t3.xlarge",
+    "subnet_id":      "subnet-06b2cf6b",
+    "SlaveTag":       "{{user `LinuxSlaveTag`}}"
+  },
+  "builders": [
+    {
+      "type": "amazon-ebs",
+      "tags": {
+        "info:opsPOC": "seth.bacon@navico.com",
+        "info:devPOC": "vladimir.shevelev@navico.com",
+        "info:busPOC": "tom.edvardsen@navico.com",
+        "cc:segment": "SHARE",
+        "cc:project": "Infrastructure R+D",
+        "cc:environment": "PROD",
+        "env:buildsystem": "RND",
+        "linuxSlaveTag": "{{user `SlaveTag`}}"
+      },
+      "run_tags": {
+        "info:opsPOC": "seth.bacon@navico.com",
+        "info:devPOC": "vladimir.shevelev@navico.com",
+        "info:busPOC": "tom.edvardsen@navico.com",
+        "cc:environment": "PROD",
+        "cc:segment": "SHARE",
+        "cc:project": "Infrastructure R+D",
+        "env:buildsystem": "RND",
+        "linuxSlaveTag": "{{user `SlaveTag`}}"
+      },
+      "access_key": "{{ user `aws_access_key` }}",
+      "secret_key": "{{ user `aws_secret_key` }}",
+      "region": "{{ user `region` }}",
+      "instance_type": "{{ user `instance_type` }}",
+      "subnet_id": "{{ user `subnet_id`}}",
+      "source_ami_filter": {
+        "filters": {
+          "virtualization-type": "hvm",
+          "name": "amzn2-ami-hvm-2.*-x86_64-gp2",
+          "root-device-type": "ebs"
+        },
+        "most_recent": true,
+        "owners": "amazon"
+      },
+      "launch_block_device_mappings" : [{
+        "device_name" : "/dev/xvda",
+        "delete_on_termination" : true,
+        "volume_size" : 200,
+        "encrypted":false,
+        "volume_type" : "gp2"
+      }],
+      "ami_block_device_mappings":[{
+        "device_name" : "/dev/xvda",
+        "delete_on_termination" : true,
+        "volume_size" : 200,
+        "encrypted":false,
+        "volume_type" : "gp2"
+      }],
+      "ami_name": "ami-linuxdockerhost-{{timestamp}}",
+      "ssh_username": "ec2-user"
+    }
+  ],
+"provisioners": [{
+      "type": "shell",
+      "inline": [
+        "sudo yum update -y",
+        "sudo yum install -y aws-cfn-bootstrap nfs-utils tmux mc",
+        "sudo amazon-linux-extras install -y docker",
+        "sudo yum clean all",
+        "sudo rm -rf /var/cache/yum",
+        "sudo usermod -a -G docker ec2-user",
+        "sudo systemctl enable docker",
+        "sudo systemctl restart docker",
+        "sudo docker login -u {{ user `DockerUser` }} -p {{ user `DockerPassword` }} {{ user `DockerRegistry` }}",
+        "sudo docker pull {{ user `DockerRegistry` }}/navico-docker/docker-ubuntu-pipeline-agent:{{user `LinuxSlaveTag`}}",
+        "sudo docker pull {{ user `DockerRegistry` }}/navico-docker/navico-sdk:master-android-armeabi_v7a-ndk19b-sdk4333796-readelf",
+        "sudo docker pull {{ user `DockerRegistry` }}/navico-docker/navico-sdk:master-noslinux_bsp_4.1.15-imx28-latest",
+        "sudo docker pull {{ user `DockerRegistry` }}/navico-docker/navico-sdk:master-noslinux_bsp_4.1.15-imx61-latest",
+        "sudo docker pull {{ user `DockerRegistry` }}/navico-docker/navico-sdk:master-noslinux_bsp_4.1.15-imx61ul-latest ",
+        "sudo docker pull {{ user `DockerRegistry` }}/navico-docker/navico-sdk:master-noslinux_dev-imx-latest",
+        "sudo docker pull {{ user `DockerRegistry` }}/navico-docker/navico-sdk:master-noslinux_dev-imx28-latest ",
+        "sudo docker pull {{ user `DockerRegistry` }}/navico-docker/navico-sdk:master-noslinux_dev-imx61-latest ",
+        "sudo docker pull {{ user `DockerRegistry` }}/navico-docker/navico-sdk:master-noslinux_qt_5.12-imx61-latest ",
+        "sudo docker pull {{ user `DockerRegistry` }}/navico-docker/navico-sdk:master-ubuntu1604_qt56-x86ubuntu-latest ",
+        "sudo docker image ls",
+        "df -h"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "rm .ssh/authorized_keys ; sudo rm /root/.ssh/authorized_keys"
+      ]
+    }
+  ],
+ "post-processors": [
+    {
+      "type": "manifest",
+      "output": "LinuxSlavesAMI-manifest.json",
+      "strip_path": true
+    }
+  ]
+}
+
+
